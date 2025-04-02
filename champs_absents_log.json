@@ -1,0 +1,5 @@
+[
+    "http.request_full_uri",
+    "dns.qry_name",
+    "payload"
+]
