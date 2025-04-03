@@ -9,9 +9,12 @@ import io
 import tempfile
 import os
 import time
+import glob
 
 # === CONFIGURATION ===
-pcap_file = "logs/log_2025-04-02-15h.pcap"
+API_BASE_URL = "http://93.127.203.48:5000"
+PCAP_DIR = "logs"  # Dossier pour stocker les fichiers PCAP
+os.makedirs(PCAP_DIR, exist_ok=True)
 
 EXTENSIONS_SUSPICIEUSES = [".exe", ".dll", ".bin", ".msi", ".scr", ".com", ".pif", ".zip", ".rar", ".7z", ".tar", ".gz",
     ".bz2", ".js", ".vbs", ".ps1", ".bat", ".cmd", ".sh", ".jar", ".apk", ".iso", ".img", ".py", ".hta"]
@@ -33,6 +36,50 @@ MITRE_DICT = {
 # === GLOBAUX ===
 anomalies_globales = []
 champs_absents = []
+
+# === FONCTIONS DE TÉLÉCHARGEMENT ===
+def get_current_filename():
+    """Récupère le nom du fichier PCAP actif"""
+    try:
+        response = requests.get(f"{API_BASE_URL}/pcap/latest/filename")
+        if response.status_code == 200:
+            return response.json().get("filename")
+        return None
+    except Exception as e:
+        print(f"Erreur lors de la récupération du nom de fichier: {e}")
+        return None
+
+def download_latest_pcap():
+    """Télécharge le dernier fichier PCAP disponible"""
+    try:
+        # Récupérer le nom du fichier actif
+        filename = get_current_filename()
+        if not filename:
+            print("Impossible de récupérer le nom du fichier actif")
+            return None
+            
+        filepath = os.path.join(PCAP_DIR, filename)
+        
+        # Vérifier si le fichier existe déjà
+        if os.path.exists(filepath):
+            print(f"Le fichier {filename} existe déjà localement")
+            return filepath
+        
+        # Télécharger le fichier
+        print(f"Téléchargement du fichier {filename}...")
+        response = requests.get(f"{API_BASE_URL}/pcap/latest", stream=True)
+        if response.status_code == 200:
+            with open(filepath, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            print(f"Fichier {filename} téléchargé avec succès")
+            return filepath
+        else:
+            print(f"Erreur lors du téléchargement: {response.status_code}")
+            return None
+    except Exception as e:
+        print(f"Erreur lors du téléchargement: {e}")
+        return None
 
 # === UTILS ===
 def log_champ_absent(champ):
@@ -318,92 +365,99 @@ def extract_details_from_pcap(pcap_file):
 
 # === MAIN ===
 def main():
-    # Télécharger le fichier PCAP actif
-    pcap_file_path = download_pcap()
-    if not pcap_file_path:
-        print("Impossible de télécharger le fichier PCAP")
-        return
-    
-    print(f"Analyse du fichier: {pcap_file_path}")
+    """Fonction principale d'analyse"""
+    # Télécharger le dernier fichier PCAP disponible
+    pcap_path = download_latest_pcap()
+    if not pcap_path:
+        print("Échec du téléchargement, recherche d'un fichier local...")
+        # Chercher des fichiers PCAP locaux
+        local_pcaps = glob.glob(os.path.join(PCAP_DIR, "*.pcap"))
+        if local_pcaps:
+            pcap_path = local_pcaps[0]  # Utiliser le premier fichier trouvé
+            print(f"Utilisation du fichier local: {pcap_path}")
+        else:
+            print("Aucun fichier PCAP trouvé localement")
+            return
     
     # Analyser le fichier PCAP
-    ip_data = extract_details_from_pcap(pcap_file_path)
+    print(f"Analyse du fichier {pcap_path}...")
+    ip_data = extract_details_from_pcap(pcap_path)
+    
+    # Traiter les données extraites
+    processed_data = []
+    
+    # Date et heure actuelles pour l'horodatage
     now = datetime.now()
-    date_str = now.strftime("%Y-%m-%d")
-    heure_str = now.strftime("%H:%M:%S")
+    current_date = now.strftime("%Y-%m-%d")
+    current_time = now.strftime("%H:%M:%S")
     
-    results = []
-    
+    # Traiter chaque IP
     for ip, info in ip_data.items():
+        # Déterminer le type d'IP (interne ou externe)
+        ip_type = "Interne" if not is_public_ip(ip) else "Externe"
+        
+        # Déterminer le pays (simplifié)
+        country = "Local" if ip_type == "Interne" else "Inconnu"
+        
         # Calculer le score de menace
         threat_score = calculate_threat_score(info, info["protocols"], info["connections"], info["anomalies"])
         
-        # Obtenir les informations MITRE
-        mitre_info = get_mitre(ip, threat_score, info["protocols"], len(info["protocols"]))
-        advanced = get_advanced_mitre(info["protocols"], info["connections"])
+        # Déterminer l'activité principale et la tactique MITRE
+        activity_info = get_mitre(ip, threat_score, info["protocols"], len(info["protocols"]))
         
-        # Ajouter les nouvelles tactiques MITRE
-        collection_info = detect_collection_tactics(info["protocols"], info["anomalies"])
-        persistence_info = detect_persistence_tactics(info["protocols"], info["anomalies"])
+        # Détecter d'autres tactiques MITRE
+        other_activities = get_advanced_mitre(info["protocols"], info["connections"])
         
-        if collection_info:
-            advanced.append(collection_info)
-        if persistence_info:
-            advanced.append(persistence_info)
-        
-        # Déterminer le pays et l'ASN (sans VirusTotal)
-        country = "Inconnu"
-        asn = "N/A"
-        as_owner = "N/A"
-        network = "N/A"
-        
-        # Déterminer si l'IP est interne ou externe
-        if is_public_ip(ip):
-            ip_type = "Externe"
-        else:
-            ip_type = "Interne"
-            country = "Local"
-        
-        # Créer l'entrée de résultat
-        result_entry = {
+        # Créer l'entrée pour cette IP
+        ip_entry = {
             "ip": ip,
-            "date": date_str,
-            "heure": heure_str,
+            "date": current_date,
+            "heure": current_time,
             "paquets": info["count"],
             "ports_diff": len(info["protocols"]),
             "protocoles": info["protocols"],
-            "connexions": info["connections"],
+            "connexions": list(info["connections"]),
             "threat_score": threat_score,
             "ip_type": ip_type,
             "country": country,
-            "asn": asn,
-            "as_owner": as_owner,
-            "network": network,
-            **mitre_info,
-            "autres_activites": advanced,
+            "asn": "N/A",
+            "as_owner": "N/A",
+            "network": "N/A",
+            "type_activite": activity_info["type_activite"],
+            "mitre_tactique": activity_info["mitre_tactique"],
+            "mitre_technique": activity_info["mitre_technique"],
+            "autres_activites": other_activities,
             "anomalies_detectees": info["anomalies"],
-            "first_seen": info.get("first_seen"),
-            "last_seen": info.get("last_seen")
+            "first_seen": info.get("first_seen", ""),
+            "last_seen": info.get("last_seen", "")
         }
         
-        results.append(result_entry)
+        processed_data.append(ip_entry)
+    
+    # Trier les données par score de menace (décroissant)
+    processed_data.sort(key=lambda x: x["threat_score"], reverse=True)
     
     # Sauvegarder les résultats
+    timestamp = now.strftime("%Y%m%d_%H%M%S")
+    
+    # Sauvegarder les données traitées
+    with open(f"analyse_ips_mitre_{timestamp}.json", "w") as f:
+        json.dump(processed_data, f, indent=4)
+    
+    # Sauvegarder également dans un fichier fixe pour faciliter l'accès
     with open("analyse_ips_mitre.json", "w") as f:
-        json.dump(results, f, indent=4)
+        json.dump(processed_data, f, indent=4)
+    
+    # Sauvegarder les anomalies globales
     with open("anomalies_globales.json", "w") as f:
         json.dump(anomalies_globales, f, indent=4)
+    
+    # Sauvegarder les champs absents
     with open("champs_absents_log.json", "w") as f:
         json.dump(champs_absents, f, indent=4)
     
-    print("✅ Analyse terminée. Données enregistrées.")
-    
-    # Ajouter un timestamp au nom de fichier pour conserver l'historique
-    timestamp = now.strftime("%Y%m%d_%H%M%S")
-    with open(f"analyse_ips_mitre_{timestamp}.json", "w") as f:
-        json.dump(results, f, indent=4)
-    
-    print(f"✅ Sauvegarde historique créée: analyse_ips_mitre_{timestamp}.json")
+    print(f"Analyse terminée. {len(processed_data)} IPs trouvées.")
+    return processed_data
 
 # Configuration de l'API
 API_BASE_URL = "http://93.127.203.48:5000"  # Remplacer par l'URL de l'API fournie

@@ -2,6 +2,7 @@ import pyshark
 import requests
 import json
 import os
+import glob
 
 def extract_kerberos_info(pcap_file, filter_str="kerberos.CNameString and kerberos.addr_nb"):
     """
@@ -74,12 +75,33 @@ def send_flag(info):
         data["flag"] = f"Erreur : {str(e)}"
         save_to_json(data)
 
-if __name__ == "__main__":
-    pcap_path = "chall_wshark1.pcap"  # Remplacez par le chemin réel du fichier PCAP
-    results = extract_kerberos_info(pcap_path)
+def get_latest_pcap():
+    """Récupère le chemin du fichier PCAP le plus récent dans le dossier logs"""
+    logs_dir = "logs"
+    pcap_files = glob.glob(os.path.join(logs_dir, "*.pcap"))
     
-    if results:
-        for info in results:
-            send_flag(info)
+    if not pcap_files:
+        # Si aucun fichier n'est trouvé dans logs, chercher dans le répertoire courant
+        pcap_files = glob.glob("*.pcap")
+        if not pcap_files:
+            return None
+    
+    # Trier les fichiers par date de modification (le plus récent en premier)
+    pcap_files.sort(key=os.path.getmtime, reverse=True)
+    return pcap_files[0]
+
+if __name__ == "__main__":
+    # Récupérer le dernier fichier PCAP
+    pcap_path = get_latest_pcap()
+    
+    if not pcap_path:
+        print("Aucun fichier PCAP trouvé. Veuillez exécuter analyse1.py pour télécharger un fichier.")
     else:
-        print("Aucune information Kerberos valide trouvée.")
+        print(f"Utilisation du fichier PCAP: {pcap_path}")
+        results = extract_kerberos_info(pcap_path)
+        
+        if results:
+            for info in results:
+                send_flag(info)
+        else:
+            print("Aucune information Kerberos valide trouvée.")
