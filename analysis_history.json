@@ -1,0 +1,20 @@
+[
+    {
+        "timestamp": "2025-04-03T14:46:36.250456",
+        "filename": "chall_wshark3.pcap",
+        "infected_ip": "172.16.1.239",
+        "mac_address": "00:13:d4:10:05:25",
+        "hostname": "DUALRUNNING",
+        "windows_user": "DESKTOP-F3P7XLU$",
+        "success": false
+    },
+    {
+        "timestamp": "2025-04-03T15:01:45.616367",
+        "filename": "chall_wshark1.pcap",
+        "infected_ip": "10.9.10.102",
+        "mac_address": "00:4f:49:b1:e8:c3",
+        "hostname": "ANGRYPOUTINE",
+        "windows_user": "hobart.gunnarsson",
+        "success": false
+    }
+]
