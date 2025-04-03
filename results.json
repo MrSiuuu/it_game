@@ -1,0 +1,12 @@
+[
+    {
+        "user_id": "marchand",
+        "lines": [
+            "00:4f:49:b1:e8:c3",
+            "10.9.10.102",
+            "DESKTOP-KKITB6Q",
+            "hobart.gunnarsson"
+        ],
+        "flag": "FLAG{a42a9bbd5451}"
+    }
+]

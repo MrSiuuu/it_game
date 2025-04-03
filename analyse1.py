@@ -11,8 +11,6 @@ import os
 import time
 
 # === CONFIGURATION ===
-VIRUSTOTAL_API_KEY = "ec5d009b7cea4342d4245ff7908b5105ce8d8e83a401f3cf071034299bcc8bfd"
-VT_URL = "https://www.virustotal.com/api/v3/ip_addresses/"
 pcap_file = "logs/log_2025-04-02-15h.pcap"
 
 EXTENSIONS_SUSPICIEUSES = [".exe", ".dll", ".bin", ".msi", ".scr", ".com", ".pif", ".zip", ".rar", ".7z", ".tar", ".gz",
@@ -42,423 +40,211 @@ def log_champ_absent(champ):
         champs_absents.append(champ)
 
 def is_public_ip(ip):
+    """Vérifie si une adresse IP est publique (non privée)"""
     try:
-        return ipaddress.ip_address(ip).is_global
+        # Convertir l'adresse IP en objet ipaddress
+        ip_obj = ipaddress.ip_address(ip)
+        
+        # Vérifier si l'IP est privée
+        return not (ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_multicast or ip_obj.is_link_local)
     except:
+        # En cas d'erreur (par exemple, si l'IP n'est pas valide), retourner False
         return False
 
-def is_safe_domain(domain):
-    return any(safe in domain for safe in SAFE_DOMAINS)
+def should_check_vt(ip_info):
+    """Détermine si une IP doit être vérifiée sur VirusTotal"""
+    # Vérifier si l'IP a des anomalies
+    has_anomalies = any(len(ip_info["anomalies"][k]) > 0 for k in ip_info["anomalies"])
+    
+    # Vérifier si l'IP utilise des protocoles suspects
+    suspicious_protocols = ["TOR", "IRC", "SMB", "RDP", "TELNET"]
+    uses_suspicious_protocol = any(p in ip_info["protocols"] for p in suspicious_protocols)
+    
+    # Vérifier si l'IP a beaucoup de connexions
+    many_connections = len(ip_info["connections"]) > 10
+    
+    return has_anomalies or uses_suspicious_protocol or many_connections
 
-# === FONCTION D'ENVOI À VIRUSTOTAL ===
-def submit_to_virustotal(content, filename="suspicious_file"):
-    """Envoie directement un fichier à VirusTotal et retourne l'ID d'analyse"""
-    try:
-        # Préparer les données pour l'API VirusTotal
-        url = "https://www.virustotal.com/api/v3/files"
-        headers = {
-            "x-apikey": VIRUSTOTAL_API_KEY,
-            "accept": "application/json"
-        }
-        
-        # S'assurer que le contenu est binaire et non vide
-        if isinstance(content, str):
-            content = content.encode()
-        
-        # Vérifier que le contenu n'est pas vide
-        if not content or len(content) < 10:
-            return {
-                "success": False,
-                "error": "Contenu trop petit pour être analysé",
-                "permalink": None
-            }
-        
-        # Créer un fichier temporaire
-        with tempfile.NamedTemporaryFile(delete=False) as temp:
-            temp.write(content)
-            temp_path = temp.name
-        
-        # Envoyer le fichier à VirusTotal
-        with open(temp_path, 'rb') as file:
-            files = {'file': (filename, file)}
-            response = requests.post(url, headers=headers, files=files)
-        
-        # Supprimer le fichier temporaire
-        os.unlink(temp_path)
-        
-        if response.status_code == 200:
-            result = response.json()
-            analysis_id = result.get('data', {}).get('id', '')
-            file_id = result.get('data', {}).get('links', {}).get('self', '').split('/')[-1]
-            
-            return {
-                "success": True,
-                "analysis_id": analysis_id,
-                "file_id": file_id,
-                "permalink": f"https://www.virustotal.com/gui/file/{file_id}/detection"
-            }
-        else:
-            return {
-                "success": False,
-                "error": f"Erreur API: {response.status_code} - {response.text}",
-                "permalink": None
-            }
-    except Exception as e:
-        return {
-            "success": False,
-            "error": f"Exception: {str(e)}",
-            "permalink": None
-        }
-
-# === ANOMALIES LOCALES ===
 def detect_local_anomalies(packet):
+    """Détecte les anomalies locales dans un paquet"""
     anomalies = {"http": [], "dns": [], "payload": [], "meta": []}
-    try:
-        if hasattr(packet, 'http') and hasattr(packet.http, 'request_full_uri'):
-            url = packet.http.request_full_uri.lower()
-            if not is_safe_domain(url) and any(ext in url for ext in EXTENSIONS_SUSPICIEUSES):
-                anomalies["http"].append(f"URL suspecte : {url}")
-                
-                # Si l'URL contient un fichier binaire, essayer de le télécharger et l'envoyer à VT
-                if any(ext in url for ext in [".exe", ".dll", ".bin"]):
-                    try:
-                        file_response = requests.get(url, timeout=5)
-                        if file_response.status_code == 200:
-                            file_content = file_response.content
-                            filename = url.split('/')[-1]
-                            vt_result = submit_to_virustotal(file_content, filename)
-                            
-                            if vt_result["success"]:
-                                anomalies["http"] += [
-                                    f"✅ Fichier envoyé à VirusTotal: {filename}",
-                                    f"🔎 Voir l'analyse: {vt_result['permalink']}"
-                                ]
-                            else:
-                                anomalies["http"].append(f"❌ Échec d'envoi à VirusTotal: {vt_result['error']}")
-                                
-                            # Toujours calculer le hash pour référence
-                            hash_url = hashlib.sha256(url.encode()).hexdigest()
-                            file_hash = hashlib.sha256(file_content).hexdigest()
-                            anomalies["http"] += [
-                                f"HASH URL: {hash_url}",
-                                f"HASH Fichier: {file_hash}",
-                                f"🔎 Voir sur VirusTotal: https://www.virustotal.com/gui/file/{file_hash}"
-                            ]
-                    except Exception as e:
-                        # En cas d'échec, revenir à la méthode du hash
-                        hash_url = hashlib.sha256(url.encode()).hexdigest()
-                        anomalies["http"] += [
-                            f"HASH URL: {hash_url}",
-                            f"🔎 Voir sur VirusTotal: https://www.virustotal.com/gui/file/{hash_url}",
-                            f"❌ Échec téléchargement: {str(e)}"
-                        ]
-                else:
-                    # Comportement standard pour les URLs non-binaires
-                    hash_url = hashlib.sha256(url.encode()).hexdigest()
-                    anomalies["http"] += [
-                        f"HASH URL: {hash_url}",
-                        f"🔎 Voir sur VirusTotal: https://www.virustotal.com/gui/file/{hash_url}"
-                    ]
-        else:
-            log_champ_absent("http.request_full_uri")
-
-        if hasattr(packet, 'dns') and hasattr(packet.dns, 'qry_name'):
-            domain = packet.dns.qry_name.lower()
-            if not is_safe_domain(domain):
-                anomalies["dns"].append(f"Domaine DNS inconnu: {domain}")
-        else:
-            log_champ_absent("dns.qry_name")
-
-        raw_content = ""
-        raw_bytes = None
+    
+    # Vérifier les anomalies HTTP
+    if hasattr(packet, 'http'):
+        # Vérifier les méthodes HTTP suspectes
+        if hasattr(packet.http, 'request_method'):
+            method = packet.http.request_method
+            if method not in ["GET", "POST", "HEAD"]:
+                anomalies["http"].append(f"Méthode HTTP non standard: {method}")
         
-        if hasattr(packet, 'tcp') and hasattr(packet.tcp, 'payload'):
-            try:
-                # Convertir la représentation hex en bytes réels
-                raw_bytes = bytes.fromhex(packet.tcp.payload.replace(':', ''))
-                hash_payload = hashlib.sha256(raw_bytes).hexdigest()
-                raw_content = packet.tcp.payload.lower()
-            except:
-                raw_content = packet.tcp.payload.lower()
-                hash_payload = hashlib.sha256(raw_content.encode()).hexdigest()
-                
-        elif hasattr(packet, 'udp') and hasattr(packet.udp, 'payload'):
-            try:
-                raw_bytes = bytes.fromhex(packet.udp.payload.replace(':', ''))
-                hash_payload = hashlib.sha256(raw_bytes).hexdigest()
-                raw_content = packet.udp.payload.lower()
-            except:
-                raw_content = packet.udp.payload.lower()
-                hash_payload = hashlib.sha256(raw_content.encode()).hexdigest()
-                
-        elif hasattr(packet, 'data') and hasattr(packet.data, 'data'):
-            try:
-                raw_bytes = bytes.fromhex(packet.data.data.replace(':', ''))
-                hash_payload = hashlib.sha256(raw_bytes).hexdigest()
-                raw_content = packet.data.data.lower()
-            except:
-                raw_content = packet.data.data.lower()
-                hash_payload = hashlib.sha256(raw_content.encode()).hexdigest()
-        else:
-            log_champ_absent("payload")
-            anomalies["meta"].append("Pas de contenu applicatif")
-            return anomalies
-
-        if raw_content:
-            # Détection de contenu suspect
-            if any(cmd in raw_content for cmd in ['cmd', 'powershell']):
-                anomalies["payload"].append("Commande malveillante détectée")
-            if 'ipc$' in raw_content:
-                anomalies["payload"].append("Accès SMB (IPC$) détecté")
-                
-            # Si le contenu semble être un exécutable ou un script
-            is_executable = False
-            if raw_bytes:
-                # Vérifier les signatures d'en-tête de fichiers exécutables
-                if ((len(raw_bytes) > 2 and raw_bytes[0:2] == b'MZ') or    # PE/EXE
-                    (len(raw_bytes) > 4 and raw_bytes[0:4] == b'\x7FELF') or    # ELF
-                    (raw_bytes.startswith(b'#!/')) or    # Script
-                    (b'powershell' in raw_bytes) or    # PowerShell
-                    (b'function ' in raw_bytes and b'return' in raw_bytes)):    # Script
-                    is_executable = True
+        # Vérifier les User-Agents suspects
+        if hasattr(packet.http, 'user_agent'):
+            user_agent = packet.http.user_agent
+            if any(x in user_agent.lower() for x in ["curl", "wget", "python", "go-http", "scanner", "nikto", "sqlmap"]):
+                anomalies["http"].append(f"User-Agent suspect: {user_agent}")
+        
+        # Vérifier les tentatives de directory traversal
+        if hasattr(packet.http, 'request_uri'):
+            uri = packet.http.request_uri
+            if "../" in uri or "..%2f" in uri.lower():
+                anomalies["http"].append(f"Tentative de directory traversal: {uri}")
             
-            if is_executable:
-                # Vérifier d'abord si le hachage existe sur VirusTotal
-                hash_check = check_hash_on_virustotal(hash_payload)
-                
-                if hash_check["exists"]:
-                    # Le fichier est déjà connu de VirusTotal
-                    malicious = hash_check.get("malicious_count", 0)
-                    suspicious = hash_check.get("suspicious_count", 0)
-                    
-                    if malicious > 0 or suspicious > 0:
-                        anomalies["payload"] += [
-                            f"⚠️ Fichier MALVEILLANT détecté sur VirusTotal: {malicious} détections",
-                            f"🔎 Voir l'analyse: {hash_check['permalink']}",
-                            f"HASH payload: {hash_payload}"
-                        ]
-                    else:
-                        anomalies["payload"] += [
-                            f"✅ Fichier vérifié sur VirusTotal (non malveillant)",
-                            f"🔎 Voir l'analyse: {hash_check['permalink']}",
-                            f"HASH payload: {hash_payload}"
-                        ]
-                else:
-                    # Le fichier n'est pas connu, l'envoyer à VirusTotal
-                    filename = f"suspicious_payload_{hash_payload[:8]}.bin"
-                    vt_result = submit_to_virustotal(raw_bytes, filename)
-                    
-                    if vt_result["success"]:
-                        anomalies["payload"] += [
-                            f"✅ Contenu suspect envoyé à VirusTotal",
-                            f"🔎 Voir l'analyse: {vt_result['permalink']}",
-                            f"HASH payload: {hash_payload}"
-                        ]
-                    else:
-                        anomalies["payload"] += [
-                            f"❌ Échec d'envoi à VirusTotal: {vt_result['error']}",
-                            f"HASH payload: {hash_payload}",
-                            f"🔎 Voir sur VirusTotal: https://www.virustotal.com/gui/file/{hash_payload}"
-                        ]
-            else:
-                # Comportement standard
-                anomalies["payload"] += [
-                    f"HASH payload: {hash_payload}",
-                    f"🔎 Voir sur VirusTotal: https://www.virustotal.com/gui/file/{hash_payload}"
-                ]
-        else:
-            anomalies["meta"].append("Pas de contenu applicatif")
-
-        # Analyse approfondie des requêtes HTTP
-        if hasattr(packet, 'http'):
-            # Vérifier si c'est une requête HTTP
-            if hasattr(packet.http, 'request'):
-                # Extraire la méthode HTTP
-                if hasattr(packet.http, 'request_method'):
-                    method = packet.http.request_method
-                    if method not in ["GET", "HEAD", "OPTIONS"]:
-                        anomalies["http"].append(f"Méthode HTTP non standard: {method}")
-                
-                # Extraire et analyser le User-Agent
-                if hasattr(packet.http, 'user_agent'):
-                    user_agent = packet.http.user_agent
-                    suspicious_agents = ["curl", "wget", "python-requests", "Go-http-client", 
-                                        "malware", "bot", "scan", "nikto", "sqlmap"]
-                    if any(agent in user_agent.lower() for agent in suspicious_agents):
-                        anomalies["http"].append(f"User-Agent suspect: {user_agent}")
-                
-                # Analyser les headers pour détecter des comportements suspects
-                if hasattr(packet.http, 'request_line'):
-                    request_line = packet.http.request_line
-                    if "/../" in request_line or "/etc/" in request_line or "/bin/" in request_line:
-                        anomalies["http"].append(f"Tentative de directory traversal: {request_line}")
+            # Vérifier les extensions de fichiers suspects dans les URI
+            for ext in EXTENSIONS_SUSPICIEUSES:
+                if uri.lower().endswith(ext):
+                    anomalies["http"].append(f"Téléchargement de fichier suspect: {uri}")
+                    break
+        
+        # Vérifier les codes de statut HTTP suspects
+        if hasattr(packet.http, 'response_code'):
+            code = packet.http.response_code
+            if code in ["500", "501", "502", "503", "504", "505"]:
+                anomalies["http"].append(f"Erreur serveur HTTP: {code}")
+            elif code in ["400", "401", "403", "404", "405"]:
+                anomalies["http"].append(f"Erreur client HTTP: {code}")
+    
+    # Vérifier les anomalies DNS
+    if hasattr(packet, 'dns'):
+        # Vérifier les requêtes DNS suspectes
+        if hasattr(packet.dns, 'qry_name'):
+            domain = packet.dns.qry_name
             
-            # Vérifier si c'est une réponse HTTP
-            if hasattr(packet.http, 'response'):
-                # Analyser le code de statut
-                if hasattr(packet.http, 'response_code'):
-                    code = int(packet.http.response_code)
-                    if code >= 500:
-                        anomalies["http"].append(f"Erreur serveur HTTP: {code}")
-                    elif code == 403 or code == 401:
-                        anomalies["http"].append(f"Accès refusé: {code}")
-                
-                # Analyser le type de contenu
-                if hasattr(packet.http, 'content_type'):
-                    content_type = packet.http.content_type
-                    suspicious_types = ["application/x-executable", "application/octet-stream", 
-                                       "application/x-dosexec", "application/x-msdownload"]
-                    if any(stype in content_type for stype in suspicious_types):
-                        anomalies["http"].append(f"Type de contenu suspect: {content_type}")
-    except Exception as e:
-        anomalies["meta"].append(f"Erreur analyse : {e}")
-
-    if any(anomalies.values()):
-        anomalies_globales.append(anomalies)
-
+            # Vérifier les domaines suspects
+            if len(domain) > 50:
+                anomalies["dns"].append(f"Nom de domaine anormalement long: {domain}")
+            
+            # Vérifier l'entropie du domaine (noms aléatoires)
+            if domain.count('.') > 4:
+                anomalies["dns"].append(f"Domaine avec trop de sous-domaines: {domain}")
+            
+            # Vérifier si le domaine contient des caractères suspects
+            if any(c.isdigit() for c in domain.split('.')[0]) and sum(c.isdigit() for c in domain.split('.')[0]) > 5:
+                anomalies["dns"].append(f"Domaine avec beaucoup de chiffres: {domain}")
+            
+            # Vérifier si c'est un domaine sûr connu
+            is_safe = any(safe in domain for safe in SAFE_DOMAINS)
+            if not is_safe and domain.count('.') >= 2:
+                # Extraire les données de la requête DNS
+                if hasattr(packet.dns, 'qry_type'):
+                    qtype = packet.dns.qry_type
+                    if qtype in ["TXT", "NULL", "ANY"]:
+                        anomalies["dns"].append(f"Type de requête DNS suspect: {qtype} pour {domain}")
+    
+    # Vérifier les anomalies de payload
+    if hasattr(packet, 'data') and hasattr(packet.data, 'data'):
+        try:
+            # Extraire les données brutes
+            raw_data = packet.data.data
+            
+            # Vérifier les signatures de fichiers exécutables
+            if "MZ" in raw_data[:10] or "PE" in raw_data[:10]:
+                anomalies["payload"].append("Signature de fichier exécutable Windows détectée")
+            elif "ELF" in raw_data[:10]:
+                anomalies["payload"].append("Signature de fichier exécutable Linux détectée")
+            
+            # Vérifier les commandes shell
+            shell_commands = ["cmd.exe", "powershell", "bash", "wget ", "curl ", "nc ", "ncat ", "certutil", "bitsadmin"]
+            for cmd in shell_commands:
+                if cmd in raw_data:
+                    anomalies["payload"].append(f"Commande shell détectée: {cmd}")
+            
+            # Calculer le hash du payload pour référence
+            try:
+                data_bytes = bytes.fromhex(raw_data.replace(':', ''))
+                if len(data_bytes) > 100:  # Ignorer les petits payloads
+                    hash_sha256 = hashlib.sha256(data_bytes).hexdigest()
+                    anomalies["payload"].append(f"HASH payload: {hash_sha256}")
+            except:
+                pass
+        except:
+            pass
+    
+    # Vérifier les métadonnées suspectes
+    if hasattr(packet, 'tcp'):
+        # Vérifier les ports suspects
+        if hasattr(packet.tcp, 'dstport'):
+            port = int(packet.tcp.dstport)
+            suspicious_ports = [22, 23, 445, 1433, 3306, 3389, 4444, 5900, 8080, 8443, 9001]
+            if port in suspicious_ports:
+                anomalies["meta"].append(f"Port suspect: {port}")
+    
     return anomalies
 
-# === MITRE LOGIQUE ===
-def get_mitre(ip, vt_score, protocols, ports_count):
-    if vt_score == "IP locale (non testable)":
-        return {}
-    if "TLS" in protocols and isinstance(vt_score, int) and vt_score >= 5:
-        return MITRE_DICT["tls_suspect"]
-    if "HTTP" in protocols and isinstance(vt_score, int) and vt_score > 0:
-        return MITRE_DICT["http_exfil"]
-    if "SSDP" in protocols or "IGMP" in protocols:
-        return MITRE_DICT["multicast_discovery"]
-    if ports_count >= 10:
+def get_mitre(ip, vt_score, protocols, port_count):
+    """Détermine la tactique MITRE ATT&CK la plus probable"""
+    # Déterminer le type d'activité en fonction des protocoles et du score
+    if "DNS" in protocols and port_count > 5:
         return MITRE_DICT["port_scan"]
-    if "HTTP" in protocols:
-        return MITRE_DICT["initial_access"]
-    return {}
+    elif "TLS" in protocols and port_count > 3:
+        return MITRE_DICT["tls_suspect"]
+    elif "HTTP" in protocols and port_count > 2:
+        return MITRE_DICT["http_exfil"]
+    elif "BROWSER" in protocols or "MDNS" in protocols:
+        return MITRE_DICT["multicast_discovery"]
+    elif "SMB" in protocols or "RDP" in protocols:
+        return MITRE_DICT["lateral_movement"]
+    elif "SSH" in protocols or "TELNET" in protocols:
+        return MITRE_DICT["privilege_escalation"]
+    else:
+        # Par défaut, considérer comme reconnaissance
+        return MITRE_DICT["port_scan"]
 
-def get_advanced_mitre(protocols, connexions):
-    activites = []
-    if "KERBEROS" in protocols or "LDAP" in protocols:
-        activites.append({
-            "type_activite": "Accès aux identifiants",
-            "mitre_tactique": "Credential Access",
-            "mitre_technique": "Brute Force (T1110)"
-        })
-    if "SMB" in protocols or "RPC_NETLOGON" in protocols or "WMI" in protocols:
-        activites.append({
-            "type_activite": "Persistance via services Windows",
-            "mitre_tactique": "Persistence",
-            "mitre_technique": "Create or Modify System Process (T1543)"
-        })
-    if "DNS" in protocols or "SSDP" in protocols or "IGMP" in protocols:
-        if len(connexions) >= 3:
-            activites.append({
-                "type_activite": "Exploration réseau",
-                "mitre_tactique": "Discovery",
-                "mitre_technique": "Remote System Discovery (T1018)"
-            })
-    if "TLS" in protocols and len(connexions) == 1:
-        activites.append({
-            "type_activite": "Évasion via canal chiffré",
-            "mitre_tactique": "Defense Evasion",
-            "mitre_technique": "Obfuscated Files or Information (T1027)"
-        })
-    return activites
-
-# === VIRUSTOTAL ===
-def check_ip_virustotal(ip):
-    headers = {"x-apikey": VIRUSTOTAL_API_KEY}
-    try:
-        r = requests.get(VT_URL + ip, headers=headers)
-        if r.status_code == 200:
-            attr = r.json()["data"]["attributes"]
-            return {
-                "malicious": attr['last_analysis_stats']['malicious'],
-                "country": attr.get("country", "Inconnu"),
-                "asn": attr.get("asn", "N/A"),
-                "as_owner": attr.get("as_owner", "N/A"),
-                "network": attr.get("network", "N/A")
-            }
-        else:
-            return {"malicious": "Erreur API"}
-    except:
-        return {"malicious": "Erreur API"}
-
-def should_check_vt(ip_info):
-    if any(ip_info["anomalies"][k] for k in ip_info["anomalies"]):
-        return True
-    if any(p in ip_info["protocols"] for p in ["TLS", "HTTP", "SMB", "LDAP"]):
-        return True
-    return ip_info.get("asn", "") not in ASN_SAFE_LIST
-
-# Au début du script
-HASH_CACHE = {}
-
-def check_hash_on_virustotal(file_hash):
-    """Vérifie si un hachage existe réellement sur VirusTotal"""
-    try:
-        url = f"https://www.virustotal.com/api/v3/files/{file_hash}"
-        headers = {
-            "x-apikey": VIRUSTOTAL_API_KEY,
-            "accept": "application/json"
-        }
-        response = requests.get(url, headers=headers)
-        
-        # Vérifier si la réponse est valide et contient des données
-        if response.status_code == 200 and 'data' in response.json():
-            result = response.json()
-            # Vérifier si l'attribut 'last_analysis_stats' existe
-            if 'attributes' in result.get('data', {}) and 'last_analysis_stats' in result['data']['attributes']:
-                stats = result['data']['attributes']['last_analysis_stats']
-                malicious = stats.get('malicious', 0)
-                suspicious = stats.get('suspicious', 0)
-                
-                # Vérifier si le fichier existe réellement en testant un autre attribut
-                if 'meaningful_name' in result['data']['attributes'] or 'type_description' in result['data']['attributes']:
-                    return {
-                        "exists": True,
-                        "malicious_count": malicious,
-                        "suspicious_count": suspicious,
-                        "permalink": f"https://www.virustotal.com/gui/file/{file_hash}"
-                    }
-        
-        # Si on arrive ici, le fichier n'existe pas ou la réponse est invalide
-        return {"exists": False, "error": "Fichier non trouvé sur VirusTotal"}
-    except Exception as e:
-        return {"exists": False, "error": str(e)}
-
-def check_multiple_hashes(hash_list):
-    """Vérifie plusieurs hachages en une seule requête"""
-    if not hash_list:
-        return {}
+def get_advanced_mitre(protocols, connections):
+    """Détecte des tactiques MITRE supplémentaires"""
+    tactics = []
     
-    # Limiter à 100 hachages par requête (limite de l'API)
-    hash_batch = hash_list[:100]
-    hash_str = ", ".join([f'"{h}"' for h in hash_batch])
+    # Vérifier les indicateurs de mouvement latéral
+    if "SMB" in protocols or "RDP" in protocols:
+        tactics.append({
+            "type_activite": "Mouvement latéral",
+            "mitre_tactique": "Lateral Movement",
+            "mitre_technique": "Remote Services (T1021)"
+        })
     
-    try:
-        url = "https://www.virustotal.com/api/v3/files"
-        headers = {
-            "x-apikey": VIRUSTOTAL_API_KEY,
-            "accept": "application/json",
-            "content-type": "application/json"
-        }
-        
-        data = {
-            "data": {
-                "type": "file_batch",
-                "attributes": {
-                    "hashes": hash_batch
-                }
-            }
-        }
-        
-        response = requests.post(url + "/analyse", headers=headers, json=data)
-        
-        if response.status_code == 200:
-            return response.json()
-        else:
-            return {"error": f"API error: {response.status_code}"}
-    except Exception as e:
-        return {"error": str(e)}
+    # Vérifier les indicateurs de Command and Control
+    if "HTTPS" in protocols and len(connections) > 5:
+        tactics.append({
+            "type_activite": "Communication C2",
+            "mitre_tactique": "Command and Control",
+            "mitre_technique": "Encrypted Channel (T1573)"
+        })
+    
+    # Vérifier les indicateurs d'exfiltration
+    if "HTTP" in protocols and len(connections) > 3:
+        tactics.append({
+            "type_activite": "Exfiltration de données",
+            "mitre_tactique": "Exfiltration",
+            "mitre_technique": "Exfiltration Over Web Service (T1567)"
+        })
+    
+    return tactics
+
+def calculate_threat_score(ip_info, protocols, connections, anomalies):
+    """Calcule un score de menace basé sur différents facteurs"""
+    score = 0
+    
+    # Nombre de protocoles différents
+    score += min(len(protocols), 10) * 0.5
+    
+    # Nombre de connexions
+    score += min(len(connections), 20) * 0.3
+    
+    # Anomalies détectées (facteur le plus important)
+    for category in anomalies:
+        score += len(anomalies[category]) * 2.0
+    
+    # Vérifier les protocoles suspects
+    suspicious_protocols = ["SMB", "RDP", "SSH", "TELNET", "FTP", "IRC", "TOR"]
+    for proto in suspicious_protocols:
+        if proto in protocols:
+            score += 3.0
+    
+    # Vérifier les connexions vers des IPs externes suspectes
+    for conn in connections:
+        if is_public_ip(conn) and not conn.startswith(("13.", "40.", "52.", "20.")):  # Exclure les IPs Microsoft
+            score += 2.0
+    
+    return score
 
 # === PCAP PARSING ===
 def extract_packet_timestamps(packet):
@@ -549,15 +335,11 @@ def main():
     results = []
     
     for ip, info in ip_data.items():
-        if is_public_ip(ip):
-            vt_info = check_ip_virustotal(ip) if should_check_vt(info) else {}
-            vt_score = vt_info.get("malicious", 0)
-        else:
-            vt_info = {}
-            vt_score = "IP locale (non testable)"
+        # Calculer le score de menace
+        threat_score = calculate_threat_score(info, info["protocols"], info["connections"], info["anomalies"])
         
         # Obtenir les informations MITRE
-        mitre_info = get_mitre(ip, vt_score, info["protocols"], len(info["protocols"]))
+        mitre_info = get_mitre(ip, threat_score, info["protocols"], len(info["protocols"]))
         advanced = get_advanced_mitre(info["protocols"], info["connections"])
         
         # Ajouter les nouvelles tactiques MITRE
@@ -569,6 +351,19 @@ def main():
         if persistence_info:
             advanced.append(persistence_info)
         
+        # Déterminer le pays et l'ASN (sans VirusTotal)
+        country = "Inconnu"
+        asn = "N/A"
+        as_owner = "N/A"
+        network = "N/A"
+        
+        # Déterminer si l'IP est interne ou externe
+        if is_public_ip(ip):
+            ip_type = "Externe"
+        else:
+            ip_type = "Interne"
+            country = "Local"
+        
         # Créer l'entrée de résultat
         result_entry = {
             "ip": ip,
@@ -578,11 +373,12 @@ def main():
             "ports_diff": len(info["protocols"]),
             "protocoles": info["protocols"],
             "connexions": info["connections"],
-            "vt_malicious": vt_score,
-            "country": vt_info.get("country", "Inconnu"),
-            "asn": vt_info.get("asn", "N/A"),
-            "as_owner": vt_info.get("as_owner", "N/A"),
-            "network": vt_info.get("network", "N/A"),
+            "threat_score": threat_score,
+            "ip_type": ip_type,
+            "country": country,
+            "asn": asn,
+            "as_owner": as_owner,
+            "network": network,
             **mitre_info,
             "autres_activites": advanced,
             "anomalies_detectees": info["anomalies"],
@@ -710,6 +506,46 @@ def detect_persistence_tactics(protocols, anomalies):
         }
     
     return persistence_info
+
+def detect_defense_evasion(protocols, anomalies):
+    """Détecte les tactiques d'évasion de défense"""
+    evasion_info = {}
+    
+    # Vérifier les indicateurs d'évasion
+    if any("obfuscated" in a.lower() or "encoded" in a.lower() or "base64" in a.lower() for a in anomalies.get("payload", [])):
+        evasion_info = {
+            "type_activite": "Code obfusqué",
+            "mitre_tactique": "Defense Evasion",
+            "mitre_technique": "Obfuscated Files or Information (T1027)"
+        }
+    elif "TLS" in protocols and len(anomalies.get("meta", [])) > 2:
+        evasion_info = {
+            "type_activite": "Communication chiffrée",
+            "mitre_tactique": "Defense Evasion",
+            "mitre_technique": "Encrypted Channel (T1573)"
+        }
+    
+    return evasion_info
+
+def detect_impact_tactics(protocols, anomalies):
+    """Détecte les tactiques d'impact"""
+    impact_info = {}
+    
+    # Vérifier les indicateurs d'impact
+    if any("encryption" in a.lower() or "ransom" in a.lower() for a in anomalies.get("payload", [])):
+        impact_info = {
+            "type_activite": "Chiffrement de données",
+            "mitre_tactique": "Impact",
+            "mitre_technique": "Data Encrypted for Impact (T1486)"
+        }
+    elif "ICMP" in protocols and len(anomalies.get("meta", [])) > 5:
+        impact_info = {
+            "type_activite": "Déni de service",
+            "mitre_tactique": "Impact",
+            "mitre_technique": "Network Denial of Service (T1498)"
+        }
+    
+    return impact_info
 
 def run_periodic_analysis(interval_minutes=30):
     """Exécute l'analyse périodiquement"""
